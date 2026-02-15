@@ -1,0 +1,150 @@
+services:
+  # ------------------------------------------------------------------------------------------------
+  # 1. Traefik (Reverse Proxy & Auto SSL)
+  # ------------------------------------------------------------------------------------------------
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    command:
+      - "--api.insecure=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.myresolver.acme.tlschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "./letsencrypt:/letsencrypt"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    networks:
+      - proxy_net
+    restart: always
+
+  # ------------------------------------------------------------------------------------------------
+  # 2. PostgreSQL (Central Database)
+  # ------------------------------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${PG_ROOT_PASSWORD}
+      # Init script in ./services/postgres/init will create n8n_db and openclaw_db
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./services/postgres/init:/docker-entrypoint-initdb.d
+    networks:
+      - internal_net
+    restart: always
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ------------------------------------------------------------------------------------------------
+  # 3. n8n (Workflow Automation)
+  # ------------------------------------------------------------------------------------------------
+  n8n:
+    image: docker.n8n.io/n8nio/n8n
+    container_name: n8n
+    environment:
+      - DB_TYPE=postgresdb
+      - DB_POSTGRESDB_HOST=postgres
+      - DB_POSTGRESDB_PORT=5432
+      - DB_POSTGRESDB_DATABASE=n8n_db
+      - DB_POSTGRESDB_USER=postgres
+      - DB_POSTGRESDB_PASSWORD=${PG_ROOT_PASSWORD}
+      - N8N_HOST=${N8N_DOMAIN}
+      - WEBHOOK_URL=https://${N8N_DOMAIN}/
+      - N8N_SECURE_COOKIE=false # For SSL offloading via Traefik
+    volumes:
+      - n8n_data:/home/node/.n8n
+    networks:
+      - proxy_net
+      - internal_net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`${N8N_DOMAIN}`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls.certresolver=myresolver"
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------------------------------------
+  # 4. OpenClaw (AI Agent) - Custom Build
+  # ------------------------------------------------------------------------------------------------
+  openclaw:
+    build:
+      context: ./services/openclaw
+      dockerfile: Dockerfile
+    container_name: openclaw
+    environment:
+      - DATABASE_URL=postgresql://postgres:${PG_ROOT_PASSWORD}@postgres:5432/openclaw_db
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      # Headless Chrome is installed in the image
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+    volumes:
+      - openclaw_data:/home/node/.openclaw
+      # Enable Sandboxing (Sister Container Pattern)
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - proxy_net
+      - internal_net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.claw.rule=Host(`${CLAW_DOMAIN}`)"
+      - "traefik.http.routers.claw.entrypoints=websecure"
+      - "traefik.http.routers.claw.tls.certresolver=myresolver"
+      - "traefik.http.services.claw.loadbalancer.server.port=18789"
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # ------------------------------------------------------------------------------------------------
+  # 5. ClawSocial (Social Media Automation) - Optional
+  # ------------------------------------------------------------------------------------------------
+  clawsocial:
+    # Builds directly from the upstream repo.
+    # To use a specific version, append #tag (e.g., .git#v1.0.0)
+    build: https://github.com/adolfousier/clawsocial.git
+    container_name: clawsocial
+    environment:
+      - NODE_ENV=production
+      - BROWSER_HEADLESS=true
+      # Credentials (added to .env)
+      - INSTAGRAM_USERNAME=${INSTAGRAM_USERNAME}
+      - INSTAGRAM_PASSWORD=${INSTAGRAM_PASSWORD}
+      - LINKEDIN_EMAIL=${LINKEDIN_EMAIL}
+      - LINKEDIN_PASSWORD=${LINKEDIN_PASSWORD}
+      - TWITTER_USERNAME=${TWITTER_USERNAME}
+      - TWITTER_PASSWORD=${TWITTER_PASSWORD}
+    volumes:
+      - clawsocial_sessions:/app/sessions
+      - clawsocial_data:/app/browser-data
+    networks:
+      - internal_net
+    restart: unless-stopped
+    # Only expose API internally to OpenClaw/n8n
+    expose:
+      - "3847"
+
+volumes:
+  db_data:
+  n8n_data:
+  openclaw_data:
+  clawsocial_sessions:
+  clawsocial_data:
+
+
+networks:
+  proxy_net:
+  internal_net:
